@@ -87,6 +87,7 @@ const AppProvider = ({ children }) => {
                 let currentUserId;
                 if (user) {
                     currentUserId = user.uid;
+                    console.log("Firebase Init Success. User ID:", currentUserId); // Untuk membantu mendapatkan UID
                     if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
                         try { await signInWithCustomToken(firebaseAuth, __initial_auth_token); } catch (e) { console.error(e); }
                     }
