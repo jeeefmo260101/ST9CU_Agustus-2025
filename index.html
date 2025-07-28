@@ -1,0 +1,512 @@
+import React, { useState, useEffect, createContext, useContext } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, setDoc, onSnapshot, updateDoc, arrayUnion } from 'firebase/firestore';
+
+// Konteks untuk manajemen state global
+const AppContext = createContext();
+
+// --- FUNGSI HELPER UNTUK MANAJEMEN WAKTU & HARI ---
+const calculateCurrentCourseDay = (startDateString) => {
+    const startDate = new Date(startDateString);
+    const today = new Date();
+    let courseDay = 0;
+    let currentDate = new Date(startDate);
+    while (currentDate <= today) {
+        const dayOfWeek = currentDate.getDay();
+        if (dayOfWeek !== 0 && dayOfWeek !== 6) {
+            courseDay++;
+        }
+        currentDate.setDate(currentDate.getDate() + 1);
+    }
+    return courseDay > 0 ? courseDay : 1;
+};
+
+const isModuleAccessible = (module, userProfile, isAdminMode) => {
+    // Jika Mode Admin aktif, semua modul bisa diakses
+    if (isAdminMode) {
+        return { accessible: true, message: "Lihat Modul (Admin)" };
+    }
+
+    if (!module || !userProfile || !userProfile.courseStartDate) {
+        return { accessible: false, message: "Sinkronisasi data..." };
+    }
+    const currentCourseDay = calculateCurrentCourseDay(userProfile.courseStartDate);
+    const now = new Date();
+    const currentHour = now.getHours();
+
+    if (module.type === 'post_test') {
+        const isDayOk = currentCourseDay >= module.day;
+        const isTimeOk = currentHour >= 9 && currentHour < 12;
+        if (!isDayOk) return { accessible: false, message: `Buka Hari ke-${module.day}` };
+        if (!isTimeOk) return { accessible: false, message: `Buka jam 09:00-12:00` };
+        return { accessible: true, message: "Mulai Post-Test" };
+    }
+    
+    const isDayOk = currentCourseDay === module.day;
+    const isTimeOk = currentHour >= 9 && currentHour < 24;
+    if (currentCourseDay < module.day) return { accessible: false, message: `Buka Hari ke-${module.day}` };
+    if (currentCourseDay > module.day) return { accessible: false, message: `Telah Berakhir` };
+    if (!isTimeOk) return { accessible: false, message: `Buka jam 09:00-23:59` };
+    if (!isDayOk) return { accessible: false, message: `Bukan jadwal hari ini` };
+    
+    return { accessible: true, message: "Lihat Modul" };
+};
+
+// --- KOMPONEN UTAMA ---
+
+const AppProvider = ({ children }) => {
+    const [currentPage, setCurrentPage] = useState('dashboard');
+    const [selectedModule, setSelectedModule] = useState(null);
+    const [showQuiz, setShowQuiz] = useState(false);
+    const [showSurvey, setShowSurvey] = useState(false);
+    const [showCertificateModal, setShowCertificateModal] = useState(false);
+    const [modules, setModules] = useState([]);
+    const [userScores, setUserScores] = useState([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [userProfile, setUserProfile] = useState(null);
+    const [userId, setUserId] = useState(null);
+    const [db, setDb] = useState(null);
+    const [isAuthReady, setIsAuthReady] = useState(false);
+    const [isLoggedIn, setIsLoggedIn] = useState(false);
+    
+    // State baru untuk fungsionalitas Admin
+    const [isAdmin, setIsAdmin] = useState(false);
+    const [isAdminMode, setIsAdminMode] = useState(false);
+    // Ganti dengan User ID Anda dari Firebase untuk simulasi
+    const ADMIN_UID = "GANTI_DENGAN_USER_ID_ADMIN_ANDA"; 
+
+    useEffect(() => {
+        try {
+            const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "DEMO_KEY", authDomain: "", projectId: "" };
+            const app = initializeApp(firebaseConfig);
+            const firestoreDb = getFirestore(app);
+            const firebaseAuth = getAuth(app);
+            setDb(firestoreDb);
+            const unsubscribe = onAuthStateChanged(firebaseAuth, async (user) => {
+                let currentUserId;
+                if (user) {
+                    currentUserId = user.uid;
+                    if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                        try { await signInWithCustomToken(firebaseAuth, __initial_auth_token); } catch (e) { console.error(e); }
+                    }
+                } else {
+                    const { user: anonUser } = await signInAnonymously(firebaseAuth);
+                    currentUserId = anonUser.uid;
+                }
+                setUserId(currentUserId);
+                // Cek apakah user saat ini adalah admin
+                if (currentUserId === ADMIN_UID) {
+                    setIsAdmin(true);
+                }
+                setIsAuthReady(true);
+            });
+            return () => unsubscribe();
+        } catch (error) {
+            console.error("Firebase Init Error:", error);
+            setIsLoading(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        const script = document.createElement('script');
+        script.src = "https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.2/papaparse.min.js";
+        script.async = true;
+        const fetchContent = () => {
+            const modulesURL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTX8b5eQdjesHBaFUiC3mHOCQSZW9yYuc85u1mSyyHhpsOKBOoVE6IBqUpmxsIIUYnpXHlnc5hamqHb/pub?gid=0&single=true&output=csv';
+            const quizzesURL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vTX8b5eQdjesHBaFUiC3mHOCQSZW9yYuc85u1mSyyHhpsOKBOoVE6IBqUpmxsIIUYnpXHlnc5hamqHb/pub?gid=863348096&single=true&output=csv';
+            window.Papa.parse(modulesURL, {
+                download: true, header: true,
+                complete: (modulesResult) => {
+                    const modulesData = modulesResult.data.filter(m => m.id && m.id.trim() !== '');
+                    window.Papa.parse(quizzesURL, {
+                        download: true, header: true,
+                        complete: (quizzesResult) => {
+                            const quizzesData = quizzesResult.data;
+                            const fetchedModules = modulesData.map(mod => ({
+                                ...mod, day: parseInt(mod.day, 10), progress: 0, completed: false, score: null, quizTaken: false,
+                                quiz: quizzesData.filter(q => q.moduleId === mod.id).map(q => ({
+                                    question: q.question, options: [q.optionA, q.optionB, q.optionC].filter(opt => opt && opt.trim() !== ''), answer: q.answer
+                                }))
+                            }));
+                            setModules(fetchedModules);
+                        }, error: () => { setModules(getStaticModules()); }
+                    });
+                }, error: () => { setModules(getStaticModules()); }
+            });
+        };
+        script.onload = fetchContent;
+        script.onerror = () => { setModules(getStaticModules()); setIsLoading(false); };
+        document.head.appendChild(script);
+        return () => { if (document.head.contains(script)) document.head.removeChild(script); };
+    }, []);
+
+    useEffect(() => {
+        if (isAuthReady && userId && db && modules.length > 0) {
+            const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+            const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/userData/profile`);
+            const unsubscribe = onSnapshot(userDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    const userData = docSnap.data();
+                    setUserProfile(userData);
+                    setUserScores(userData.scores || []);
+                    if (userData.namaLengkap && userData.nip) {
+                        setIsLoggedIn(true);
+                    }
+                    if (!userData.courseStartDate) {
+                        setDoc(userDocRef, { courseStartDate: new Date().toISOString() }, { merge: true });
+                    }
+                    const mergedModules = modules.map(sheetModule => {
+                        const userProgress = (userData.modules || []).find(um => um.id === sheetModule.id);
+                        return userProgress ? { ...sheetModule, ...userProgress } : sheetModule;
+                    });
+                    setModules(mergedModules);
+                } else {
+                    const initialProfile = { modules, scores: [], courseStartDate: new Date().toISOString() };
+                    setDoc(userDocRef, initialProfile);
+                    setUserProfile(initialProfile);
+                }
+                setIsLoading(false);
+            }, () => { setIsLoading(false); });
+            return () => unsubscribe();
+        }
+    }, [isAuthReady, userId, db, modules.length > 0]);
+
+    const handleLogin = async (namaLengkap, nip) => {
+        if (!db || !userId || !namaLengkap || !nip) return;
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/userData/profile`);
+        try {
+            await setDoc(userDocRef, { namaLengkap, nip }, { merge: true });
+            setIsLoggedIn(true);
+        } catch (error) {
+            console.error("Login Error:", error);
+        }
+    };
+
+    const updateModuleProgress = async (moduleId, newProgress, completedStatus, score = null, quizTaken = false) => {
+        if (!db || !userId) return;
+        const updatedModules = modules.map(mod => mod.id === moduleId ? { ...mod, progress: newProgress, completed: completedStatus, score, quizTaken } : mod);
+        setModules(updatedModules);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/userData/profile`);
+        try { await setDoc(userDocRef, { modules: updatedModules }, { merge: true }); } catch (error) { console.error("Update Progress Error:", error); }
+    };
+
+    const addScoreToHistory = async (moduleTitle, score, percentage, totalQuestions) => {
+        if (!db || !userId) return;
+        const newScoreEntry = { module: moduleTitle, score, percentage, total: totalQuestions, date: new Date().toISOString().split('T')[0] };
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const userDocRef = doc(db, `artifacts/${appId}/users/${userId}/userData/profile`);
+        try { await updateDoc(userDocRef, { scores: arrayUnion(newScoreEntry) }); } catch (error) { console.error("Add Score Error:", error); }
+    };
+
+    const allModulesCompleted = modules.length > 0 && modules.every(mod => mod.completed);
+    
+    const value = { currentPage, setCurrentPage, selectedModule, setSelectedModule, showQuiz, setShowQuiz, showSurvey, setShowSurvey, showCertificateModal, setShowCertificateModal, modules, userScores, updateModuleProgress, addScoreToHistory, allModulesCompleted, isLoading, userId, userProfile, isLoggedIn, handleLogin, isAdmin, isAdminMode, setIsAdminMode };
+
+    return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
+};
+
+const LoginPage = () => {
+    const { handleLogin } = useContext(AppContext);
+    const [nama, setNama] = useState('');
+    const [nip, setNip] = useState('');
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const handleSubmit = async (e) => {
+        e.preventDefault();
+        if (!nama.trim() || !nip.trim()) { alert("Nama Lengkap dan NIP tidak boleh kosong."); return; }
+        setIsSubmitting(true);
+        await handleLogin(nama, nip);
+    };
+    return (
+        <div className="flex items-center justify-center min-h-screen bg-gray-100">
+            <div className="w-full max-w-md p-8 space-y-8 bg-white rounded-lg shadow-md">
+                <div className="text-center"><h2 className="text-3xl font-bold text-gray-900">Selamat Datang</h2><p className="mt-2 text-gray-600">Silakan masukkan data Anda untuk memulai.</p></div>
+                <form className="mt-8 space-y-6" onSubmit={handleSubmit}>
+                    <div><label htmlFor="nama-lengkap" className="sr-only">Nama Lengkap</label><input id="nama-lengkap" name="nama" type="text" required className="w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="Nama Lengkap (dengan gelar)" value={nama} onChange={(e) => setNama(e.target.value)} /></div>
+                    <div><label htmlFor="nip" className="sr-only">NIP</label><input id="nip" name="nip" type="text" required className="w-full px-3 py-2 border border-gray-300 rounded-md" placeholder="NIP" value={nip} onChange={(e) => setNip(e.target.value)} /></div>
+                    <div><button type="submit" disabled={isSubmitting} className="w-full flex justify-center py-2 px-4 border rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300">{isSubmitting ? 'Menyimpan...' : 'Masuk'}</button></div>
+                </form>
+            </div>
+        </div>
+    );
+};
+
+const AdminToggle = () => {
+    const { isAdmin, isAdminMode, setIsAdminMode } = useContext(AppContext);
+
+    if (!isAdmin) return null;
+
+    return (
+        <div className="mt-4 p-3 bg-yellow-100 text-yellow-800 rounded-lg">
+            <label htmlFor="admin-mode-toggle" className="flex items-center justify-between cursor-pointer">
+                <span className="font-semibold">Mode Admin</span>
+                <div className="relative">
+                    <input type="checkbox" id="admin-mode-toggle" className="sr-only" checked={isAdminMode} onChange={() => setIsAdminMode(!isAdminMode)} />
+                    <div className="block bg-gray-300 w-10 h-6 rounded-full"></div>
+                    <div className={`dot absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${isAdminMode ? 'transform translate-x-full bg-green-500' : ''}`}></div>
+                </div>
+            </label>
+        </div>
+    );
+};
+
+const Sidebar = () => {
+    const { setCurrentPage, userProfile } = useContext(AppContext);
+    return (
+        <div className="w-64 bg-white shadow-lg h-screen fixed top-0 left-0 flex flex-col p-6 rounded-r-lg">
+            <div className="text-2xl font-bold text-gray-800 mb-8">E-Learning SDM</div>
+            <nav className="flex-grow">
+                <ul>
+                    <li className="mb-4"><button onClick={() => setCurrentPage('dashboard')} className="flex items-center text-gray-700 hover:text-blue-600 hover:bg-blue-50 rounded-lg p-3 w-full text-left"><svg className="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001 1h3v-3m-3 3h3v-3m-3 0V9m0 3h.01M12 10h.01M12 14h.01M12 18h.01"></path></svg>Dashboard</button></li>
+                    <li className="mb-4"><button onClick={() => setCurrentPage('modules')} className="flex items-center text-gray-700 hover:text-blue-600 hover:bg-blue-50 rounded-lg p-3 w-full text-left"><svg className="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 6.253v13m0-13C10.832 5.477 9.246 5 7.5 5S4.168 5.477 3 6.253v13C4.168 18.477 5.754 18 7.5 18s3.332.477 4.5 1.253m0-13C13.168 5.477 14.754 5 16.5 5c1.747 0 3.332.477 4.5 1.253v13C19.832 18.477 18.246 18 16.5 18c-1.747 0-3.332.477-4.5 1.253"></path></svg>Modul</button></li>
+                    <li className="mb-4"><button onClick={() => setCurrentPage('my-scores')} className="flex items-center text-gray-700 hover:text-blue-600 hover:bg-blue-50 rounded-lg p-3 w-full text-left"><svg className="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c-1.38 0-2.71-.48-4-1.33C2.71 16.67 1.38 16 0 16v-3c1.38 0 2.71.48 4 1.33C5.29 14.33 6.62 15 8 15h1V6L21 3v13"></path></svg>Nilai Saya</button></li>
+                </ul>
+            </nav>
+            <div className="mt-auto">
+                <div className="flex items-center p-3 text-gray-700">
+                    <div className="w-10 h-10 bg-blue-200 rounded-full flex items-center justify-center text-blue-800 font-bold mr-3">{userProfile?.namaLengkap ? userProfile.namaLengkap.substring(0, 2).toUpperCase() : '??'}</div>
+                    <div><div className="font-semibold truncate">{userProfile?.namaLengkap || 'Pengguna'}</div><div className="text-sm text-gray-500">{userProfile?.nip || 'NIP tidak tersedia'}</div></div>
+                </div>
+                <AdminToggle />
+            </div>
+        </div>
+    );
+};
+
+const Header = () => (
+    <div className="flex justify-end p-6 bg-white shadow-sm rounded-bl-lg">
+        <div className="flex items-center space-x-4">
+            <div className="w-10 h-10 bg-gray-200 rounded-full flex items-center justify-center text-gray-600 font-bold">SDU</div>
+            <span className="text-gray-700 text-sm">SDU + DN</span>
+        </div>
+    </div>
+);
+
+const Dashboard = () => {
+    const { setCurrentPage, setSelectedModule, modules, allModulesCompleted, setShowSurvey, userScores, userProfile, isAdminMode } = useContext(AppContext);
+    const dailyModules = modules.filter(m => m.type === 'daily_material');
+    const postTestModule = modules.find(m => m.type === 'post_test');
+    const totalDailyModules = dailyModules.length;
+    const completedDailyModules = dailyModules.filter(mod => mod.completed).length;
+    const currentCourseDay = userProfile ? calculateCurrentCourseDay(userProfile.courseStartDate) : 0;
+    const moduleForToday = dailyModules.find(m => m.day === currentCourseDay);
+    const continueLearningModule = moduleForToday || dailyModules.find(m => !m.completed) || dailyModules[0];
+    const latestScoreEntry = userScores.length > 0 ? userScores[userScores.length - 1] : null;
+    const handleStartModule = (module) => {
+        if (module) {
+            const { accessible } = isModuleAccessible(module, userProfile, isAdminMode);
+            if(accessible) { setSelectedModule(module); setCurrentPage('module-detail'); }
+        }
+    };
+    return (
+        <div className="p-8 bg-gray-50 min-h-screen rounded-lg">
+            <h1 className="text-3xl font-bold text-gray-800 mb-8">Dashboard</h1>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
+                <div className="bg-white p-6 rounded-xl shadow-md"><h2 className="text-lg font-semibold">Progres Pembelajaran</h2><p className="text-3xl font-bold my-2">{completedDailyModules}/{totalDailyModules} Modul Harian</p><div className="w-full bg-gray-200 rounded-full h-2.5"><div className="bg-blue-500 h-2.5 rounded-full" style={{ width: totalDailyModules > 0 ? `${(completedDailyModules / totalDailyModules) * 100}%` : '0%' }}></div></div></div>
+                <div className="bg-white p-6 rounded-xl shadow-md"><h2 className="text-lg font-semibold">Modul Hari Ini (Hari ke-{currentCourseDay})</h2><p className="text-xl font-bold my-2">{continueLearningModule?.title || 'Tidak ada modul hari ini'}</p><button onClick={() => handleStartModule(continueLearningModule)} className="text-blue-600 font-semibold">Mulai Belajar &rarr;</button></div>
+                <div className="bg-white p-6 rounded-xl shadow-md"><h2 className="text-lg font-semibold">Skor Terakhir</h2><p className="text-3xl font-bold my-2">{latestScoreEntry ? `${latestScoreEntry.score}/${latestScoreEntry.total}` : 'N/A'}</p><p className="text-sm text-gray-500">{latestScoreEntry?.module || 'Belum ada kuis'}</p></div>
+            </div>
+            {allModulesCompleted ? (<div className="bg-green-100 border-l-4 border-green-500 text-green-700 p-4 rounded-lg mb-8"><h3 className="font-bold">Selamat! Anda Telah Menyelesaikan Seluruh Program!</h3><p>Silakan lanjutkan ke survei untuk mendapatkan sertifikat Anda.</p></div>) : postTestModule && dailyModules.every(m => m.completed) ? (<div className="bg-yellow-100 border-l-4 border-yellow-500 text-yellow-700 p-4 rounded-lg mb-8"><h3 className="font-bold">Semua Materi Selesai!</h3><p>Post-Test akan tersedia pada Hari ke-{postTestModule.day}.</p></div>) : null}
+            <div className="bg-white p-8 rounded-xl shadow-md">
+                <h2 className="text-2xl font-bold text-gray-800 mb-4">Selamat Datang di E-Learning SDM</h2>
+                <p className="text-gray-600 mb-6">Program pembelajaran intensif selama satu bulan untuk meningkatkan kompetensi Anda sebagai ASN.</p>
+                {allModulesCompleted && (<div className="mt-6 p-4 bg-green-100 text-green-800 rounded-lg flex items-center justify-between"><span>Langkah terakhir, isi survei singkat kami.</span><button onClick={() => setShowSurvey(true)} className="bg-green-600 text-white font-bold py-2 px-4 rounded-lg">Ikuti Survei</button></div>)}
+            </div>
+        </div>
+    );
+};
+
+const LearningModules = () => {
+    const { setCurrentPage, setSelectedModule, modules, userProfile, isAdminMode } = useContext(AppContext);
+    const handleViewModule = (module) => {
+        const { accessible } = isModuleAccessible(module, userProfile, isAdminMode);
+        if (accessible) { setSelectedModule(module); setCurrentPage('module-detail'); }
+    };
+    return (
+        <div className="p-8 bg-gray-50 min-h-screen rounded-lg">
+            <h1 className="text-3xl font-bold text-gray-800 mb-8">Daftar Modul & Ujian</h1>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                {modules.map(module => {
+                    const { accessible, message } = isModuleAccessible(module, userProfile, isAdminMode);
+                    const isPostTest = module.type === 'post_test';
+                    return (
+                        <div key={module.id} className={`p-6 rounded-xl shadow-md flex flex-col ${!accessible ? 'bg-gray-100' : 'bg-white'} ${isPostTest ? 'md:col-span-2 lg:col-span-4 bg-blue-50' : ''}`}>
+                            <h2 className={`text-xl font-semibold ${!accessible ? 'text-gray-500' : 'text-gray-800'}`}>{module.title}</h2>
+                            <p className={`my-4 flex-grow ${!accessible ? 'text-gray-400' : 'text-gray-600'}`}>{module.description}</p>
+                            {!isPostTest && <div className="mb-4"><p className="text-sm text-gray-500 mb-1">Progres: {module.progress}%</p><div className="w-full bg-gray-200 rounded-full h-2.5"><div className="bg-blue-500 h-2.5 rounded-full" style={{ width: `${module.progress}%` }}></div></div></div>}
+                            <button onClick={() => handleViewModule(module)} disabled={!accessible} className={`mt-auto w-full text-white font-bold py-2 px-4 rounded-lg ${isPostTest ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-500 hover:bg-blue-600'} disabled:bg-gray-400 disabled:cursor-not-allowed`}>
+                                {message}
+                            </button>
+                        </div>
+                    );
+                })}
+            </div>
+        </div>
+    );
+};
+
+const ModuleDetail = () => {
+    const { setCurrentPage, selectedModule, setShowQuiz, updateModuleProgress, userProfile, isAdminMode } = useContext(AppContext);
+    if (!selectedModule) return <div className="p-8">Modul tidak ditemukan.</div>;
+    const { accessible, message } = isModuleAccessible(selectedModule, userProfile, isAdminMode);
+    if (!accessible) {
+        return (
+            <div className="p-8 bg-gray-50 min-h-screen rounded-lg flex flex-col items-center justify-center text-center">
+                <svg className="w-16 h-16 text-yellow-500 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                <h1 className="text-2xl font-bold text-gray-700">Modul Terkunci</h1>
+                <p className="text-gray-600 mt-2">{message}</p>
+                <button onClick={() => setCurrentPage('modules')} className="mt-6 bg-blue-500 hover:bg-blue-600 text-white font-bold py-2 px-4 rounded-lg">Kembali</button>
+            </div>
+        );
+    }
+    const isPostTest = selectedModule.type === 'post_test';
+    const materialRead = selectedModule.progress >= 50;
+    const handleMarkAsDone = () => updateModuleProgress(selectedModule.id, 50, false);
+    const handleTakeQuiz = () => (isPostTest || materialRead) && setShowQuiz(true);
+    return (
+        <div className="p-8 bg-gray-50 min-h-screen rounded-lg">
+            <button onClick={() => setCurrentPage('modules')} className="flex items-center text-blue-600 mb-6 font-semibold">&larr; Kembali ke Daftar Modul</button>
+            <h1 className="text-3xl font-bold text-gray-800 mb-2">{selectedModule.title}</h1>
+            <p className="text-gray-600 mb-6">{selectedModule.description}</p>
+            <div className="bg-white p-8 rounded-xl shadow-md">
+                <div className="prose max-w-none" dangerouslySetInnerHTML={{ __html: selectedModule.material }} />
+                {!isPostTest && !materialRead && <button onClick={handleMarkAsDone} className="mt-6 bg-green-500 text-white font-bold py-2 px-4 rounded-lg">Tandai Selesai Membaca</button>}
+            </div>
+            <div className="mt-8 text-right">
+                <button onClick={handleTakeQuiz} disabled={(!isPostTest && !materialRead) || selectedModule.quizTaken} className={`flex items-center ml-auto text-white font-bold py-3 px-6 rounded-full shadow-lg ${isPostTest ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-500 hover:bg-blue-600'} disabled:opacity-50 disabled:cursor-not-allowed`}>
+                    {selectedModule.quizTaken ? 'Selesai Dikerjakan' : (isPostTest ? 'Mulai Post-Test' : 'Ambil Kuis')}
+                    <svg className="w-5 h-5 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01"></path></svg>
+                </button>
+            </div>
+        </div>
+    );
+};
+
+const QuizModal = () => {
+    const { selectedModule, setShowQuiz, updateModuleProgress, addScoreToHistory } = useContext(AppContext);
+    const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+    const [userAnswers, setUserAnswers] = useState({});
+    const [showResult, setShowResult] = useState(false);
+    const [score, setScore] = useState(0);
+    const handleOptionSelect = (qIndex, option) => setUserAnswers(prev => ({ ...prev, [qIndex]: option }));
+    const handleNextQuestion = () => {
+        if (currentQuestionIndex < selectedModule.quiz.length - 1) { setCurrentQuestionIndex(prev => prev + 1); } else { calculateScore(); setShowResult(true); }
+    };
+    const calculateScore = () => {
+        let correctAnswers = 0;
+        selectedModule.quiz.forEach((q, index) => { if (userAnswers[index] === q.answer) correctAnswers++; });
+        const totalQuestions = selectedModule.quiz.length;
+        const percentage = totalQuestions > 0 ? (correctAnswers / totalQuestions) * 100 : 0;
+        setScore(correctAnswers);
+        updateModuleProgress(selectedModule.id, 100, true, correctAnswers, true);
+        addScoreToHistory(selectedModule.title, correctAnswers, Math.round(percentage), totalQuestions);
+    };
+    const handleCloseQuiz = () => setShowQuiz(false);
+    if (!selectedModule || !selectedModule.quiz) return null;
+    const currentQuestion = selectedModule.quiz[currentQuestionIndex];
+    return (
+        <div className="fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center p-4 z-50">
+            <div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg relative">
+                {!showResult ? (
+                    <>
+                        <h2 className="text-2xl font-bold mb-6">{selectedModule.title}</h2>
+                        <p className="text-lg font-semibold mb-3">{currentQuestionIndex + 1}. {currentQuestion.question}</p>
+                        <div className="space-y-3">
+                            {currentQuestion.options.map((opt, idx) => <button key={idx} onClick={() => handleOptionSelect(currentQuestionIndex, opt)} className={`w-full text-left p-3 rounded-lg border ${userAnswers[currentQuestionIndex] === opt ? 'bg-blue-100 border-blue-500' : 'bg-gray-50 hover:bg-gray-100'}`}>{opt}</button>)}
+                        </div>
+                        <div className="flex justify-between items-center mt-6">
+                            <span>Pertanyaan {currentQuestionIndex + 1} dari {selectedModule.quiz.length}</span>
+                            <button onClick={handleNextQuestion} disabled={userAnswers[currentQuestionIndex] === undefined} className="bg-blue-500 text-white font-bold py-2 px-5 rounded-lg disabled:opacity-50">{currentQuestionIndex === selectedModule.quiz.length - 1 ? 'Selesai' : 'Berikutnya'}</button>
+                        </div>
+                    </>
+                ) : (
+                    <div className="text-center">
+                        <h2 className="text-3xl font-bold mb-4">Hasil Ujian</h2>
+                        <p className="text-xl mb-6">Anda menjawab benar {score} dari {selectedModule.quiz.length} soal.</p>
+                        <p className="text-4xl font-extrabold text-blue-600 mb-8">{Math.round((score / selectedModule.quiz.length) * 100)}%</p>
+                        <button onClick={handleCloseQuiz} className="bg-blue-500 text-white font-bold py-3 px-6 rounded-lg">Tutup</button>
+                    </div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+const MyScoreHistory = () => {
+    const { userScores } = useContext(AppContext);
+    return (
+        <div className="p-8 bg-gray-50 min-h-screen rounded-lg">
+            <h1 className="text-3xl font-bold text-gray-800 mb-8">Riwayat Skor Saya</h1>
+            <div className="bg-white p-6 rounded-xl shadow-md border border-gray-200">
+                {userScores.length > 0 ? (
+                    <div className="overflow-x-auto">
+                        <table className="min-w-full divide-y divide-gray-200">
+                            <thead className="bg-gray-50"><tr><th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Modul</th><th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Skor</th><th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Persentase</th><th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tanggal</th></tr></thead>
+                            <tbody className="bg-white divide-y divide-gray-200">
+                                {[...userScores].reverse().map((score, index) => (
+                                    <tr key={index}>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{score.module}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{score.score}/{score.total}</td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm"><span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full ${score.percentage >= 80 ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}`}>{score.percentage}%</span></td>
+                                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{score.date}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                ) : <p className="text-gray-500">Belum ada riwayat kuis.</p>}
+            </div>
+        </div>
+    );
+};
+const SurveyModal = () => {
+    const { setShowSurvey, setShowCertificateModal } = useContext(AppContext);
+    const handleSubmit = (e) => { e.preventDefault(); setShowSurvey(false); setShowCertificateModal(true); };
+    return <div className="fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center p-4 z-50"><form onSubmit={handleSubmit} className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg"><h2 className="text-2xl font-bold mb-6">Survei Kepuasan</h2><p className="mb-6">Terima kasih telah menyelesaikan program pembelajaran ini. Silakan berikan masukan Anda.</p><div className="flex justify-end"><button type="button" onClick={() => setShowSurvey(false)} className="bg-gray-300 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2">Batal</button><button type="submit" className="bg-blue-500 text-white font-bold py-2 px-4 rounded-lg">Lanjut ke Sertifikat</button></div></form></div>
+};
+const CertificateModal = () => {
+    const { setShowCertificateModal } = useContext(AppContext);
+    const certificateLink = `https://drive.google.com/drive/folders/1NSJANZwXuR9aA9acz37ta2b2DkG4I2O2?usp=sharing`;
+    return <div className="fixed inset-0 bg-gray-800 bg-opacity-75 flex items-center justify-center p-4 z-50"><div className="bg-white p-8 rounded-xl shadow-2xl w-full max-w-lg text-center"><h2 className="text-3xl font-bold text-green-600 mb-4">Selamat!</h2><p className="text-xl text-gray-700 mb-8">Anda telah menyelesaikan seluruh rangkaian program pembelajaran.</p><a href={certificateLink} target="_blank" rel="noopener noreferrer" className="inline-flex items-center bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg"><svg className="w-6 h-6 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>Unduh Sertifikat</a><button onClick={() => setShowCertificateModal(false)} className="mt-6 block mx-auto bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg">Tutup</button></div></div>
+};
+
+const App = () => {
+    const { currentPage, showQuiz, showSurvey, showCertificateModal, isLoading, isLoggedIn } = useContext(AppContext);
+    const renderPage = () => {
+        if (isLoading) return <div className="flex justify-center items-center h-full"><div className="text-xl font-semibold text-gray-600">Memuat data...</div></div>;
+        if (!isLoggedIn) return <LoginPage />;
+        switch (currentPage) {
+            case 'dashboard': return <Dashboard />;
+            case 'modules': return <LearningModules />;
+            case 'my-scores': return <MyScoreHistory />;
+            case 'module-detail': return <ModuleDetail />;
+            default: return <Dashboard />;
+        }
+    };
+    return (
+        <div className="font-inter antialiased bg-gray-100 min-h-screen">
+            {isLoading ? (
+                <div className="flex justify-center items-center h-screen"><div className="text-xl">Memuat...</div></div>
+            ) : isLoggedIn ? (
+                <div className="flex">
+                    <Sidebar />
+                    <div className="flex-1 ml-64 flex flex-col h-screen">
+                        <Header />
+                        <main className="flex-1 p-6 overflow-y-auto">{renderPage()}</main>
+                    </div>
+                </div>
+            ) : (
+                <LoginPage />
+            )}
+            {showQuiz && <QuizModal />}
+            {showSurvey && <SurveyModal />}
+            {showCertificateModal && <CertificateModal />}
+        </div>
+    );
+};
+
+const getStaticModules = () => [{ day: 1, type: 'daily_material', id: 'fallback-1', title: 'Fallback Modul (Lokal)', description: 'Gagal memuat dari Google Sheet.', progress: 0, completed: false, score: null, quizTaken: false, material: '<h2>Data Lokal</h2>', quiz: [] }];
+
+export default function WrappedApp() { return <AppProvider><App /></AppProvider>; }
